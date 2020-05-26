@@ -1,0 +1,210 @@
+BEAM: embed erlexec and EPMD
+
+In order to prevent erlexec from execv()-ing or spawning a separate process
+to run run BEAM or EPMD, the functionalites of erlexec are now embedded in
+BEAM, so that if the BEAM executable file (or a symbolic link to it) is
+named "erlexec", BEAM accepts erlexec's command line options. In addition,
+EPMD is run as a separate thread instead of as a separate process.
+
+diff -upr otp_orig/erts/emulator/Makefile.in otp/erts/emulator/Makefile.in
+--- otp_orig/erts/emulator/Makefile.in	2020-05-13 10:47:33.000000000 +0200
++++ otp/erts/emulator/Makefile.in	2020-05-24 19:42:03.192928031 +0200
+@@ -361,6 +361,9 @@ ifeq ($(TARGET),win32)
+ LIBS    += -L$(ERL_TOP)/erts/emulator/pcre/obj/$(TARGET)/$(TYPE) -lepcre
+ else
+ LIBS    += $(ERL_TOP)/erts/emulator/pcre/obj/$(TARGET)/$(TYPE)/$(LIB_PREFIX)epcre$(LIB_SUFFIX)
++ERLEXEC_DIR = $(ERL_TOP)/erts/etc/common
++EPMD_DIR = $(ERL_TOP)/erts/epmd
++include $(EPMD_DIR)/epmd.mk
+ endif
+ 
+ EPCRE_LIB = $(ERL_TOP)/erts/emulator/pcre/obj/$(TARGET)/$(TYPE)/$(LIB_PREFIX)epcre$(LIB_SUFFIX)
+@@ -741,6 +744,17 @@ $(OBJDIR)/dll_sys.o: sys/$(ERLANG_OSTYPE
+ $(OBJDIR)/beams.$(RES_EXT): $(TARGET)/beams.rc
+ 	$(V_RC) -o $@  -I$(ERL_TOP)/erts/etc/win32 $(TARGET)/beams.rc
+ 
++else
++
++$(OBJDIR)/erlexec.o: $(ERLEXEC_DIR)/erlexec.c
++	$(V_CC) $(CFLAGS) -DRUN_FROM_EMU -DOTP_SYSTEM_VERSION=\"$(SYSTEM_VSN)\" $(INCLUDES) -c $< -o $@
++$(OBJDIR)/epmd.o: $(EPMD_DIR)/src/epmd.c
++	$(V_CC) $(CFLAGS) -DDONT_USE_MAIN -DEPMD_PORT_NO=$(EPMD_PORT_NO) $(INCLUDES) -c $< -o $@
++$(OBJDIR)/epmd_cli.o: $(EPMD_DIR)/src/epmd_cli.c
++	$(V_CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
++$(OBJDIR)/epmd_srv.o: $(EPMD_DIR)/src/epmd_srv.c
++	$(V_CC) $(CFLAGS) -DDONT_USE_MAIN $(INCLUDES) -c $< -o $@
++
+ endif
+ 
+ # We disable the implicit rule of .S -> .o so that the verbose asm
+@@ -979,6 +993,10 @@ OS_OBJS = \
+ 
+ else
+ OS_OBJS = \
++	$(OBJDIR)/erlexec.o \
++	$(OBJDIR)/epmd.o \
++	$(OBJDIR)/epmd_cli.o \
++	$(OBJDIR)/epmd_srv.o \
+ 	$(OBJDIR)/sys.o \
+ 	$(OBJDIR)/sys_drivers.o \
+ 	$(OBJDIR)/sys_env.o \
+diff -upr otp_orig/erts/emulator/sys/unix/erl_main.c otp/erts/emulator/sys/unix/erl_main.c
+--- otp_orig/erts/emulator/sys/unix/erl_main.c	2020-05-13 10:47:33.000000000 +0200
++++ otp/erts/emulator/sys/unix/erl_main.c	2020-05-24 16:17:56.295100864 +0200
+@@ -27,6 +27,17 @@
+ int
+ main(int argc, char **argv)
+ {
++    char *prog_name = rindex(argv[0], '/');
++
++    if (prog_name)
++        prog_name++;
++    else
++        prog_name = argv[0];
++    if (!strcmp(prog_name, "erlexec")) {
++        extern int erlexec_main(int argc, char **argv);
++
++        return erlexec_main(argc, argv);
++    }
+     erl_start(argc, argv);
+     return 0;
+ }
+diff -upr otp_orig/erts/etc/common/erlexec.c otp/erts/etc/common/erlexec.c
+--- otp_orig/erts/etc/common/erlexec.c	2020-05-13 10:47:33.000000000 +0200
++++ otp/erts/etc/common/erlexec.c	2020-05-26 16:03:12.906863498 +0200
+@@ -25,6 +25,10 @@
+ 
+ #include "etc_common.h"
+ 
++#if defined(RUN_FROM_EMU)
++#  include "global.h"
++#endif
++
+ #include "erl_driver.h"
+ #include "erl_misc_utils.h"
+ 
+@@ -227,6 +231,9 @@ int start_emulator(char* emu, char*start
+ #endif
+ 
+ 
++#if defined(RUN_FROM_EMU)
++int erlexec_main(int argc, char **argv);
++#endif
+ 
+ /*
+  * Variables.
+@@ -411,6 +418,8 @@ static void add_boot_config(void)
+ 
+ #ifdef __WIN32__
+ __declspec(dllexport) int win_erlexec(int argc, char **argv, HANDLE module, int windowed)
++#elif defined(RUN_FROM_EMU)
++int erlexec_main(int argc, char **argv)
+ #else
+ int main(int argc, char **argv)
+ #endif
+@@ -451,7 +460,7 @@ int main(int argc, char **argv)
+ 	goto skip_arg_massage;
+     }
+     free_env_val(s);
+-#else
++#elif !defined(RUN_FROM_EMU)
+     int reset_cerl_detached = 0;
+ 
+     s = get_env("CERL_DETACHED_PROG");
+@@ -721,16 +730,6 @@ int main(int argc, char **argv)
+ 			add_Eargs("-B");
+ 			haltAfterwards = 1;
+ 			i = argc; /* Skip rest of command line */
+-		    } else if (strcmp(argv[i], "-man") == 0) {
+-#if defined(__WIN32__)
+-			error("-man not supported on Windows");
+-#else
+-			argv[i] = "man";
+-			erts_snprintf(tmpStr, sizeof(tmpStr), "%s/man", rootdir);
+-			set_env("MANPATH", tmpStr);
+-			execvp("man", argv+i);
+-			error("Could not execute the 'man' command.");
+-#endif
+ 		    } else
+ 			add_arg(argv[i]);
+ 		    break;
+@@ -1132,6 +1131,10 @@ int main(int argc, char **argv)
+ 
+ #else
+ 
++#if defined(RUN_FROM_EMU)
++    erl_start(EargsCnt, Eargsp);
++    return 0;
++#else
+  skip_arg_massage:
+     if (start_detached) {
+ 	int status = fork();
+@@ -1184,6 +1187,7 @@ int main(int argc, char **argv)
+     }
+     return 1;
+ #endif
++#endif
+ }
+ 
+ 
+@@ -1196,7 +1200,7 @@ usage_aux(void)
+ #ifdef __WIN32__
+ 	  "[-start_erl [datafile]] "
+ #endif
+-	  "[-make] [-man [manopts] MANPAGE] [-x] [-emu_args] [-start_epmd BOOLEAN] "
++	  "[-make] [-x] [-emu_args] [-start_epmd BOOLEAN] "
+ 	  "[-args_file FILENAME] [+A THREADS] [+a SIZE] [+B[c|d|i]] [+c [BOOLEAN]] "
+ 	  "[+C MODE] [+h HEAP_SIZE_OPTION] [+K BOOLEAN] "
+ 	  "[+l] [+M<SUBSWITCH> <ARGUMENT>] [+P MAX_PROCS] [+Q MAX_PORTS] "
+@@ -1233,9 +1237,31 @@ usage_format(char *format, ...)
+     usage_aux();
+ }
+ 
++#if defined(RUN_FROM_EMU)
++static void *epmd_thread(void *arg)
++{
++    extern int epmd(int argc, char **argv);
++    char *argv[] = {
++            "epmd"
++    };
++    epmd(1, argv);
++    return NULL;
++}
++#endif
++
+ void
+ start_epmd(char *epmd)
+ {
++#if defined(RUN_FROM_EMU)
++    pthread_t thread;
++    int result;
++
++    result = pthread_create(&thread, NULL, epmd_thread, NULL);
++    if (result) {
++      fprintf(stderr, "Error spawning epmd (error %d)\n", result);
++      exit(1);
++    }
++#else
+     char  epmd_cmd[MAXPATHLEN+100];
+ #ifdef __WIN32__
+     char* arg1 = NULL;
+@@ -1278,6 +1304,7 @@ start_epmd(char *epmd)
+       fprintf(stderr, "Error spawning %s (error %d)\n", epmd_cmd,errno);
+       exit(1);
+     }
++#endif
+ }
+ 
+ static void
+diff -upr otp_orig/make/install_bin otp/make/install_bin
+--- otp_orig/make/install_bin	2020-05-13 10:47:34.000000000 +0200
++++ otp/make/install_bin	2020-05-26 15:47:43.274844730 +0200
+@@ -698,6 +698,8 @@ for file in "$@"; do
+     }
+ done
+ 
++mv $erlang_bindir/../erts-11.0/bin/beam.smp $erlang_bindir/../erts-11.0/bin/erlexec
++
+ test "$tst" = "" || echo "{ok,{$paths,\"$iprfx$bindir\",\"$src_dir\"}}." > $tst
+ 
+ exit 0 # Done
