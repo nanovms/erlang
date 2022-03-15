@@ -10,12 +10,12 @@ Patch your repo:
 ```
 patch -p1 -ruN -d ~/otp < 0001-BEAM-embed-erlexec-and-EPMD.patch
 patch -p1 -ruN -d ~/otp < 0002-kernel-auth-erl-skip-cookie-file-permission-checks.patch
+patch -p1 -ruN -d ~/otp < 0003-erl_child_setup_thread.patch
 ```
 
 Build:
 ```
 ./configure && make
-cp bin/x86_64-unknown-linux-gnu/beam.smp bin/x86_64-unknown-linux-gnu/erlexec
 sudo make install
 ```
 
@@ -53,7 +53,6 @@ cp /usr/local/lib/erlang/erts-11.0/bin/erlexec .
 RUN
 
 ```
-eyberg@s1:~/hir$ !1984
 ops run -c config.json erlexec
 
 [/usr/local/lib/erlang/erts-11.0/bin/erlexec -noshell -s hi start -s

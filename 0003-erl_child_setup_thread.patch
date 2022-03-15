@@ -1,0 +1,1239 @@
+Thread-based erl_child_setup alternative
+
+erlang/OTP uses an external program called "erl_child_setup" to handle the
+spawning of (and communication with) external processes. One of the principal
+uses of this program is to in turn execute the "inet_gethost" program, which
+is used to resolve internet addresses. To enable support for erlang/OTP under
+Nanos, these two programs are internalized here as pthread-based versions.
+Currently, only inet_gethost is emulated, but command lines for other programs
+may be parsed and handled by thread-based versions of those programs if
+necessary. These thread-based alternatives will only be used if the host
+operating system name (via uname(2)) is set to "Nanos", and otherwise the
+behavior will remain unchanged.
+
+diff --git a/erts/emulator/Makefile.in b/erts/emulator/Makefile.in
+index da61fdf..9f114b3 100644
+--- a/erts/emulator/Makefile.in
++++ b/erts/emulator/Makefile.in
+@@ -994,6 +994,7 @@ OS_OBJS = \
+ else
+ OS_OBJS = \
+ 	$(OBJDIR)/erlexec.o \
++	$(OBJDIR)/erl_child_setup_thread.o \
+ 	$(OBJDIR)/epmd.o \
+ 	$(OBJDIR)/epmd_cli.o \
+ 	$(OBJDIR)/epmd_srv.o \
+diff --git a/erts/emulator/sys/unix/erl_child_setup.h b/erts/emulator/sys/unix/erl_child_setup.h
+index 0058b92..6032697 100644
+--- a/erts/emulator/sys/unix/erl_child_setup.h
++++ b/erts/emulator/sys/unix/erl_child_setup.h
+@@ -64,7 +64,10 @@ typedef struct ErtsSysForkerProto_ {
+             int fds[3];
+         } start;
+         struct {
+-            pid_t os_pid;
++            union {
++                pid_t os_pid;
++                pthread_t os_pthread;
++            };
+             int error_number;
+         } go;
+         struct {
+@@ -74,4 +77,6 @@ typedef struct ErtsSysForkerProto_ {
+     } u;
+ } ErtsSysForkerProto;
+ 
++extern void *erl_child_setup_thread(void *arg);
++
+ #endif /* #ifndef _ERL_UNIX_FORKER_H */
+diff --git a/erts/emulator/sys/unix/erl_child_setup_thread.c b/erts/emulator/sys/unix/erl_child_setup_thread.c
+new file mode 100644
+index 0000000..7a13a03
+--- /dev/null
++++ b/erts/emulator/sys/unix/erl_child_setup_thread.c
+@@ -0,0 +1,1011 @@
++/*
++ * %CopyrightBegin%
++ *
++ * Copyright Ericsson AB 1996-2020. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * %CopyrightEnd%
++ */
++
++/* internal erl_child_setup / inet_gethost for single-process environment (nanos) */
++
++#ifdef HAVE_CONFIG_H
++#  include "config.h"
++#endif
++
++#include <stdio.h>
++#include <stdarg.h>
++#include <errno.h>
++#include <unistd.h>
++#include <sys/prctl.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/select.h>
++#include <arpa/inet.h>
++#include <pthread.h>
++
++#define WANT_NONBLOCKING    /* must define this to pull in defs from sys.h */
++#include "sys.h"
++
++#include "erl_sys_driver.h"
++#include "sys_uds.h"
++
++#include "erl_child_setup.h"
++
++//#define HARD_DEBUG
++#ifdef HARD_DEBUG
++#define DEBUG_PRINT(fmt, ...) do {fprintf(stderr, "child:" fmt "\r\n", ##__VA_ARGS__);} while(0)
++#else
++#define DEBUG_PRINT(fmt, ...)
++#endif
++
++static char abort_reason[200]; /* for core dump inspection */
++
++static void ABORT(const char* fmt, ...)
++{
++    va_list arglist;
++    va_start(arglist, fmt);
++    vsprintf(abort_reason, fmt, arglist);
++    fprintf(stderr, "erl_child_setup: %s\r\n", abort_reason);
++    va_end(arglist);
++    pthread_exit((void *)1);
++}
++
++#define warning(fmt, ...) do {fprintf(stderr, "erl_child_setup_thread warning: " fmt, ##__VA_ARGS__);} while(0)
++
++/* *** inet_gethost */
++
++/* The serial numbers of the requests */
++typedef int SerialType;
++
++#define INVALID_SERIAL -1
++
++/* The operations performed by this program */
++typedef unsigned char OpType;
++
++#define OP_GETHOSTBYNAME 1
++#define OP_GETHOSTBYADDR 2
++#define OP_CANCEL_REQUEST 3
++#define OP_CONTROL 4
++
++/* The protocol (IPV4/IPV6) */
++typedef unsigned char ProtoType;
++
++#define PROTO_IPV4 1
++#define PROTO_IPV6 2
++
++/* OP_CONTROL */
++typedef unsigned char CtlType;
++#define SETOPT_DEBUG_LEVEL 0
++
++/* The unit of an IP address (0 == error, 4 == IPV4, 16 == IPV6) */
++typedef unsigned char UnitType;
++
++#define UNIT_ERROR 0
++#define UNIT_IPV4  4
++#define UNIT_IPV6 16
++
++/* And the byte type */
++typedef unsigned char AddrByte; /* Must be compatible with character
++				   datatype */
++
++/*
++ * Encode/decode/read/write
++ */
++
++static ssize_t read_exact(int fd, void *vbuff, size_t nbytes);
++
++static size_t _read_int32(int fd, int *res)
++{
++    AddrByte b[4];
++    int r;
++    if ((r = read_exact(fd,b,4)) < 0) {
++	return -1;
++    } else if (r == 0) {
++	return 0;
++    } else {
++	*res = (unsigned) b[3];
++	*res |= ((unsigned) b[2]) << 8;
++	*res |= ((unsigned) b[1]) << 16;
++	*res |= ((unsigned) b[0]) << 24;
++    }
++    return 4;
++}
++
++static void _put_int32(AddrByte *buff, int value)
++{
++    buff[0] = (((unsigned) value) >> 24) & 0xFF;
++    buff[1] = (((unsigned) value) >> 16) & 0xFF;
++    buff[2] = (((unsigned) value) >> 8) & 0xFF;
++    buff[3] = ((unsigned) value) & 0xFF;
++}
++
++static ssize_t read_exact(int fd, void *vbuff, size_t nbytes)
++{
++    ssize_t ret, got;
++    char *buff = vbuff;
++
++    got = 0;
++    for(;;) {
++        DEBUG_PRINT("%s: nbytes %ld, got %ld", __func__, nbytes, got);
++	ret = read(fd, buff, nbytes - got);
++        DEBUG_PRINT("   ret %ld", ret);
++	if (ret < 0) {
++	    if (errno == EINTR) {
++		continue;
++	    } else {
++		DEBUG_PRINT("Error while reading from pipe,"
++                            " errno = %d", errno);
++		return -1;
++	    }
++	} else if (ret == 0) {
++	    DEBUG_PRINT("End of file while reading from pipe.");
++	    if (got == 0) {
++		return 0; /* "Normal" EOF */
++	    } else {
++		return -1;
++	    }
++	} else if (ret < nbytes - got) {
++	    got += ret;
++	    buff += ret;
++	} else {
++	    return nbytes;
++	}
++    }
++}
++
++static OpType get_op(AddrByte *buff)
++{
++    return (OpType) buff[4];
++}
++
++static AddrByte *get_op_addr(AddrByte *buff)
++{
++    return buff + 4;
++}
++
++static SerialType get_serial(AddrByte *buff)
++{
++    return get_int32(buff);
++}
++
++static ProtoType get_proto(AddrByte *buff)
++{
++    return (ProtoType) buff[5];
++}
++
++static CtlType get_ctl(AddrByte *buff)
++{
++    return (CtlType) buff[5];
++}
++
++static AddrByte *get_data(AddrByte *buff)
++{
++    return buff + 6;
++}
++
++static int get_debug_level(AddrByte *buff)
++{
++    return get_int32(buff + 6);
++}
++
++#define PACKET_BYTES 4
++#define READ_PACKET_BYTES(X,Y) _read_int32((X),(Y))
++#define PUT_PACKET_BYTES(X,Y) _put_int32((X),(Y))
++
++/*
++ * Marshalled format of request:
++ *{
++ *  Serial: 32 bit big endian
++ *  Op:8 bit  [1,2,3]
++ *  If op == 1 {
++ *    Proto:8 bit [1,2]
++ *    Str: Null terminated array of characters
++ *  } Else if op == 2 {
++ *    Proto:8 bit [1,2]
++ *    If proto == 1 {
++ *      B0..B3: 4 bytes, most significant first
++ *    } Else (proto == 2) {
++ *      B0..B15: 16 bytes, most significant first
++ *    }
++ *  }
++ *  (No more if op == 3)
++ *}
++ * The request arrives as a packet, with 4 packet size bytes.
++ */
++
++/* Internal error codes */
++#define ERRCODE_NOTSUP 1
++#define ERRCODE_HOST_NOT_FOUND 2
++#define ERRCODE_TRY_AGAIN 3
++#define ERRCODE_NO_RECOVERY 4
++#define ERRCODE_NO_DATA 5
++#define ERRCODE_NETDB_INTERNAL 7
++
++static int read_request(int fd, AddrByte **buff, size_t *buff_size)
++{
++    int siz;
++    int r;
++
++    if ((r = READ_PACKET_BYTES(fd, &siz)) != PACKET_BYTES) {
++	if (r == 0) {
++	    return 0;
++	} else {
++	    erts_exit(ERTS_ABORT_EXIT, "Unexpected end of file on main input, errno = %d",errno);
++	}
++    }
++
++    if (siz > *buff_size) {
++        int size = *buff_size = siz;
++	if (*buff_size == 0) {
++	    *buff = malloc(size);
++            if (!*buff)
++                erts_exit(ERTS_ABORT_EXIT, "%s: unable to malloc size %d\n", __func__, size);
++	} else {
++	    *buff = realloc(*buff, size);
++            if (!*buff)
++                erts_exit(ERTS_ABORT_EXIT, "%s: unable to realloc to size %d\n", __func__, size);
++	}
++    }
++    if (read_exact(fd, *buff, siz) != siz) {
++	erts_exit(ERTS_ABORT_EXIT, "Unexpected end of file on main input, errno = %d",errno);
++    }
++    if (siz < 5) {
++	erts_exit(ERTS_ABORT_EXIT, "Unexpected message on main input, message size %d less "
++	      "than minimum.");
++    }
++    return siz;
++}
++
++#define DOMAINNAME_MAX 258 /* 255 + Opcode + Protocol + Null termination */
++
++#ifdef HARD_DEBUG
++static char *format_address(int siz, AddrByte *addr)
++{
++    static char buff[50];
++    char tmp[10];
++    if (siz > 16) {
++	return "(unknown)";
++    }
++    *buff='\0';
++    if (siz <= 4) {
++	while(siz--) {
++	    erts_snprintf(tmp, sizeof(tmp), "%d",(int) *addr++);
++	    strcat(buff,tmp);
++	    if(siz) {
++		strcat(buff,".");
++	    }
++	}
++	return buff;
++    }
++    while(siz--) {
++	erts_snprintf(tmp, sizeof(tmp), "%02x",(int) *addr++);
++	strcat(buff,tmp);
++	if(siz) {
++	    strcat(buff,":");
++	}
++    }
++    return buff;
++}
++#endif
++
++/*
++ * Domain name "parsing" and worker specific queueing
++ */
++static void domaincopy(AddrByte *out, AddrByte *in)
++{
++    AddrByte *ptr = out;
++    *ptr++ = *in++;
++    *ptr++ = *in++;
++    switch(*out) {
++    case OP_GETHOSTBYNAME:
++	while(*in != '\0' && *in != '.')
++	    ++in;
++	strncpy((char*)ptr, (char*)in, DOMAINNAME_MAX-2);
++	ptr[DOMAINNAME_MAX-3] = '\0';
++	DEBUG_PRINT("Saved domainname %s.", ptr);
++	return;
++    case OP_GETHOSTBYADDR:
++	memcpy(ptr,in, ((out[1] == PROTO_IPV4) ? UNIT_IPV4 : UNIT_IPV6) - 1);
++	DEBUG_PRINT("Saved domain address: %s.",
++                    format_address(((out[1] == PROTO_IPV4) ?
++                                    UNIT_IPV4 : UNIT_IPV6) - 1,ptr));
++	return;
++    default:
++	erts_exit(ERTS_ABORT_EXIT, "Trying to copy buffer not containing valid domain, [%d,%d].",
++	      (int) out[0], (int) out[1]);
++    }
++}
++
++static int get_domainname(AddrByte *inbuff, int insize, AddrByte *domainbuff)
++{
++    OpType op = get_op(inbuff);
++    ProtoType proto;
++    int i;
++    AddrByte *data;
++
++    data = get_data(inbuff);
++    switch (op) {
++    case OP_GETHOSTBYNAME:
++	data = get_data(inbuff);
++	for (i = (data - inbuff); i < insize && inbuff[i] != '\0'; ++i)
++	    ;
++	if (i < insize) {
++	    domaincopy(domainbuff, get_op_addr(inbuff));
++	    return 0;
++	}
++	DEBUG_PRINT("Could not pick valid domainname in "
++                    "gethostbyname operation");
++	return -1;
++    case OP_GETHOSTBYADDR:
++	proto = get_proto(inbuff);
++	i = insize - (data - inbuff);
++	if ((proto == PROTO_IPV4 && i == UNIT_IPV4) ||
++	    (proto == PROTO_IPV6 && i == UNIT_IPV6)) {
++	    /* An address buffer */
++	    domaincopy(domainbuff, get_op_addr(inbuff));
++	    return 0;
++	}
++	DEBUG_PRINT("Could not pick valid domainname in gethostbyaddr "
++                    "operation");
++	return -1;
++    default:
++	DEBUG_PRINT("Could not pick valid domainname because of "
++                    "invalid opcode %d.", (int) op);
++	return -1;
++    }
++}
++
++static int map_netdb_error_ai(int netdb_code)
++{
++    switch(netdb_code) {
++#ifdef EAI_ADDRFAMILY
++    case EAI_ADDRFAMILY:
++	return ERRCODE_NETDB_INTERNAL;
++#endif
++    case EAI_AGAIN:
++	return ERRCODE_TRY_AGAIN;
++    case EAI_BADFLAGS:
++	return ERRCODE_NETDB_INTERNAL;
++    case EAI_FAIL:
++	return ERRCODE_HOST_NOT_FOUND;
++    case EAI_FAMILY:
++	return ERRCODE_NETDB_INTERNAL;
++    case EAI_MEMORY:
++	return ERRCODE_NETDB_INTERNAL;
++#if defined(EAI_NODATA) && EAI_NODATA != EAI_NONAME
++    case EAI_NODATA:
++	return ERRCODE_HOST_NOT_FOUND;
++#endif
++    case EAI_NONAME:
++	return ERRCODE_HOST_NOT_FOUND;
++    case EAI_SERVICE:
++	return ERRCODE_NETDB_INTERNAL;
++    case EAI_SOCKTYPE:
++	return ERRCODE_NETDB_INTERNAL;
++    default:
++	return ERRCODE_NETDB_INTERNAL;
++    }
++}
++
++static size_t build_reply_ai(SerialType serial,
++                             int family, int addrlen,
++			     struct addrinfo *res0,
++			     AddrByte **preply)
++{
++    struct addrinfo *res;
++    int num_strings;
++    int num_addresses;
++    AddrByte *ptr;
++    int need;
++
++    num_addresses = 0;
++    num_strings = 0;
++    need = PACKET_BYTES +
++	4 /* Serial */ + 1 /* addrlen */ +
++	4 /* Naddr */ + 4 /* Nnames */;
++
++    for (res = res0; res != NULL; res = res->ai_next) {
++        if ((res->ai_addr) &&
++            (res->ai_addr->sa_family == family)) {
++            num_addresses++;
++            need += addrlen;
++        }
++        if ((res->ai_canonname) &&
++            (res->ai_family == family)) {
++            num_strings++;
++            need += strlen(res->ai_canonname) + 1;
++        }
++    }
++
++    *preply = malloc(need);
++    ASSERT(*preply != NULL);
++    ptr = *preply;
++    PUT_PACKET_BYTES(ptr,need - PACKET_BYTES);
++    ptr += PACKET_BYTES;
++    _put_int32(ptr,serial);
++    ptr +=4;
++    *ptr++ = (AddrByte) addrlen; /* 4 or 16 */
++    _put_int32(ptr, num_addresses);
++    ptr += 4;
++    for (res = res0; res != NULL; res = res->ai_next) {
++        if ((res->ai_addr) &&
++            (res->ai_addr->sa_family == family)) {
++            const void *src;
++            switch (family) {
++            case AF_INET:
++                src = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
++                DEBUG_PRINT("AF_INET: %s", format_address(4, (AddrByte *)src));
++                break;
++#ifdef AF_INET6
++            case AF_INET6:
++                src = &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
++                DEBUG_PRINT("AF_INET6: %s", format_address(16, (AddrByte *)src));
++                break;
++#endif
++            default:
++                src = res->ai_addr->sa_data;
++            }
++            memcpy(ptr, src, addrlen);
++            ptr += addrlen;
++        }
++    }
++    _put_int32(ptr, num_strings);
++    ptr += 4;
++    for (res = res0; res != NULL; res = res->ai_next) {
++        if ((res->ai_canonname) &&
++            (res->ai_family == family)) {
++            strcpy((char *)ptr, res->ai_canonname);
++            ptr += strlen(res->ai_canonname) + 1;
++        }
++    }
++    return need;
++}
++
++static char *errcode_to_string(int errcode)
++{
++    switch (errcode) {
++    case ERRCODE_NOTSUP:
++	return "enotsup";
++    case ERRCODE_HOST_NOT_FOUND:
++	/*
++	 * I would preffer
++	 * return "host_not_found";
++	 * but have to keep compatibility with the old
++	 * inet_gethost's error codes...
++	 */
++	return "notfound";
++    case ERRCODE_TRY_AGAIN:
++	return "try_again";
++    case ERRCODE_NO_RECOVERY:
++	return "no_recovery";
++    case ERRCODE_NO_DATA:
++	return "no_data";
++    default:
++	/*case ERRCODE_NETDB_INTERNAL:*/
++	return "netdb_internal";
++    }
++}
++
++static size_t build_error_reply(SerialType serial, int errnum, AddrByte **preply)
++{
++    char *errstring = errcode_to_string(errnum);
++    int string_need = strlen(errstring) + 1; /* a '\0' too */
++    unsigned need;
++    AddrByte *ptr;
++
++    need = PACKET_BYTES + 4 /* Serial */ + 1 /* Unit */ + string_need;
++    *preply = malloc(need);
++    ASSERT(*preply);
++    ptr = *preply;
++    PUT_PACKET_BYTES(ptr,need - PACKET_BYTES);
++    ptr += PACKET_BYTES;
++    _put_int32(ptr,serial);
++    ptr +=4;
++    *ptr++ = (AddrByte) 0; /* 4 or 16 */
++    strcpy((char*)ptr, errstring);
++    return need;
++}
++
++struct inet_gethost_worker_record {
++    AddrByte *inbuff;
++    int insize;
++    int out_fd;
++};
++
++static void *simple_inet_gethost_worker(void *arg)
++{
++    struct inet_gethost_worker_record *rec = arg;
++    struct addrinfo *ai = NULL;
++    int error_num = 0;
++    AddrByte *reply = NULL;
++    size_t data_size = 0;
++    OpType op = get_op(rec->inbuff);
++    AddrByte *data = get_data(rec->inbuff);
++    SerialType serial = get_serial(rec->inbuff);
++    ProtoType proto = get_proto(rec->inbuff);
++    int family = 0;
++    struct sockaddr *sa = NULL;
++    char name[NI_MAXHOST];
++    struct addrinfo hints;
++
++    prctl(PR_SET_NAME, "inet_gethost_worker");
++    switch (op) {
++    case OP_GETHOSTBYNAME:
++        switch (proto) {
++        case PROTO_IPV6:
++            family = AF_INET6;
++            break;
++        case PROTO_IPV4:
++            family = AF_INET;
++            break;
++        }
++        memset(&hints, 0, sizeof(hints));
++        hints.ai_flags = AI_CANONNAME;
++        hints.ai_socktype = SOCK_STREAM;
++        hints.ai_family = family;
++        DEBUG_PRINT("Starting getaddrinfo(%s, ...)", data);
++        error_num = getaddrinfo((const char *)data, NULL, &hints, &ai);
++        DEBUG_PRINT("getaddrinfo returned %d", error_num);
++        if (error_num == EAI_SYSTEM) {
++            DEBUG_PRINT("EAI_SYSTEM: errno %d (%s)\n", errno, strerror(errno));
++        }
++        if (error_num) {
++            error_num = map_netdb_error_ai(error_num);
++        }
++        if (proto == 0) {
++            warning("%s: bad proto %d\n", __func__, proto);
++            data_size = build_error_reply(serial, ERRCODE_NOTSUP, &reply);
++        } else {
++            data_size = build_reply_ai(serial, family, family == AF_INET ? 4 : 16,
++                                       ai, &reply);
++            freeaddrinfo(ai);
++        }
++        break;
++    case OP_GETHOSTBYADDR:
++        switch (proto) {
++        case PROTO_IPV6: {
++            struct sockaddr_in6 *sin6;
++            socklen_t salen = sizeof(*sin6);
++            sin6 = malloc(salen);
++            sin6->sin6_family = AF_INET6;
++            sin6->sin6_port = 0;
++            memcpy(&sin6->sin6_addr, data, 16);
++            sa = (struct sockaddr *)sin6;
++            DEBUG_PRINT("Starting getnameinfo for address %s",
++                        format_address(16, data));
++            error_num = getnameinfo(sa, salen, name, sizeof(name),
++                                    NULL, 0, NI_NAMEREQD);
++            DEBUG_PRINT("getnameinfo returned %d", error_num);
++            if (error_num) {
++                error_num = map_netdb_error_ai(error_num);
++                free(sa);
++                sa = NULL;
++            }
++        } break;
++        case PROTO_IPV4: {
++            struct sockaddr_in *sin;
++            socklen_t salen = sizeof(*sin);
++            sin = malloc(salen);
++            sin->sin_family = AF_INET;
++            sin->sin_port = 0;
++            memcpy(&sin->sin_addr, data, 4);
++            sa = (struct sockaddr *)sin;
++            DEBUG_PRINT("Starting getnameinfo for address %s",
++                        format_address(4, data));
++            error_num = getnameinfo(sa, salen, name, sizeof(name),
++                                    NULL, 0, NI_NAMEREQD);
++            DEBUG_PRINT("getnameinfo returned %d", error_num);
++            if (error_num) {
++                error_num = map_netdb_error_ai(error_num);
++                free(sa);
++                sa = NULL;
++            }
++        } break;
++        default:
++            error_num = ERRCODE_NOTSUP;
++        }
++        break;
++
++        if (sa) {
++            struct addrinfo res;
++            memset(&res, 0, sizeof(res));
++            res.ai_canonname = name;
++            res.ai_addr = sa;
++            res.ai_next = NULL;
++            data_size = build_reply_ai(serial, family, family == AF_INET ? 4 : 16,
++                                       &res, &reply);
++            free(sa);
++        } else {
++            data_size = build_error_reply(serial, error_num, &reply);
++        }
++        break;
++    default:
++        warning("%s: unhandled op %d\n", __func__, op);
++        data_size = build_error_reply(serial, ERRCODE_NOTSUP, &reply);
++    }
++
++    /* write response */
++    if (data_size > 0 && write(rec->out_fd, reply, data_size) < 0) {
++        warning("%s: write to out_fd %d, size %ld failed: %d (%s)\n",
++                __func__, rec->out_fd, data_size, errno, strerror(errno));
++    }
++    free(reply);
++    free(rec);
++    return 0;
++}
++
++static int simple_inet_gethost(int *pipes)
++{
++    int in_fd = pipes[0];
++    int out_fd = pipes[1];
++    AddrByte *inbuff = NULL;
++    int insize;
++    size_t inbuff_size = 0;
++    fd_set fds;
++    int max_fd;
++    AddrByte domainbuff[DOMAINNAME_MAX];
++    struct inet_gethost_worker_record *rec;
++    pthread_t pt;
++
++    prctl(PR_SET_NAME, "inet_gethost");
++    for(;;) {
++	max_fd = in_fd;
++	FD_ZERO(&fds);
++	FD_SET(in_fd,&fds);
++	for (;;) {
++	    if (select(max_fd + 1,&fds,NULL,NULL,NULL) < 0) {
++		if (errno == EINTR) {
++		    continue;
++		} else {
++		    erts_exit(ERTS_ABORT_EXIT, "Select failed (invalid internal structures?), "
++                              "errno = %d.",errno);
++		}
++	    }
++	    break;
++	}
++
++        if (FD_ISSET(in_fd,&fds)) {
++	    OpType op;
++	    insize = read_request(in_fd, &inbuff, &inbuff_size);
++	    if (insize == 0) { /* Other errors taken care of in
++				    read_request */
++		DEBUG_PRINT("Erlang has closed.");
++                close(pipes[0]);
++                close(pipes[1]);
++                free(pipes);
++                pthread_exit(0);
++	    }
++	    op = get_op(inbuff);
++	    if (op == OP_CANCEL_REQUEST) {
++                warning("OP_CANCEL_REQUEST unhandled\n");
++		continue;
++	    } else if (op == OP_CONTROL) {
++		CtlType ctl;
++		SerialType serial = get_serial(inbuff);
++		if (serial != INVALID_SERIAL) {
++		    erts_exit(ERTS_ABORT_EXIT, "Invalid serial: %d.", serial);
++		}
++		switch (ctl = get_ctl(inbuff)) {
++		case SETOPT_DEBUG_LEVEL:
++                {
++                    int tmp_debug_level = get_debug_level(inbuff);
++                    warning("SETOPT_DEBUG_LEVEL (level %d) ignored\n", tmp_debug_level);
++                }
++                break;
++		default:
++		    warning("Unknown control requested from erlang (%d), "
++			    "message discarded.", (int) ctl);
++		    break;
++		}
++		continue; /* New select */
++	    } else {
++		ProtoType proto;
++		if (op != OP_GETHOSTBYNAME && op != OP_GETHOSTBYADDR) {
++		    warning("Unknown operation requested from erlang (%d), "
++			    "message discarded.", op);
++		    continue;
++		}
++		if ((proto = get_proto(inbuff)) != PROTO_IPV4 &&
++		    proto != PROTO_IPV6) {
++		    warning("Unknown protocol requested from erlang (%d), "
++			    "message discarded.", proto);
++		    continue;
++		}
++		if (get_domainname(inbuff,insize,domainbuff) < 0) {
++		    warning("Malformed message sent from erlang, no domain, (%d)"
++			    "message discarded.", op);
++		    continue;
++		}
++	    }
++
++            rec = malloc(sizeof(struct inet_gethost_worker_record));
++            if (!rec)
++                erts_exit(ERTS_ABORT_EXIT, "malloc of inet_gethost_worker_record failed");
++
++            rec->inbuff = inbuff;
++            rec->insize = insize;
++            rec->out_fd = out_fd;
++
++            if (pthread_create(&pt, 0, simple_inet_gethost_worker, rec) < 0) {
++                erts_exit(ERTS_ABORT_EXIT,
++                          "Could not create inet_gethost worker pthread: %d (%s)\n",
++                          errno, strerror(errno));
++            }
++            if (pthread_detach(pt) < 0) {
++                erts_exit(ERTS_ABORT_EXIT,
++                          "Unable to detach inet_gethost worker pthread: %d (%s)\n",
++                          errno, strerror(errno));
++            }
++	}
++    }
++}
++
++static void *start_new_child(void *arg)
++{
++    int *pipes = arg;
++    int errln = -1;
++    int size, res, i, pos = 0, retcode = 0;
++    char *buff, *o_buff;
++
++    char *cmd, *cwd, *wd, **new_environ, **args = NULL;
++    char *p;
++
++    Sint32 cnt, flags;
++
++    DEBUG_PRINT("%s: fd %d", __func__, pipes[0]);
++    do {
++        res = read(pipes[0], (char*)&size, sizeof(size));
++    } while(res < 0 && (errno == EINTR || errno == ERRNO_BLOCK));
++
++    if (res <= 0) {
++        errln = __LINE__;
++        goto child_error;
++    }
++
++    buff = malloc(size);
++
++    DEBUG_PRINT("size = %d", size);
++
++    do {
++        if ((res = read(pipes[0], buff + pos, size - pos)) < 0) {
++            if (errno == ERRNO_BLOCK || errno == EINTR)
++                continue;
++            errln = __LINE__;
++            goto child_error;
++        }
++        if (res == 0) {
++            errno = EPIPE;
++            errln = __LINE__;
++            goto child_error;
++        }
++        pos += res;
++    } while(size - pos != 0);
++
++    o_buff = buff;
++
++    flags = get_int32(buff);
++    buff += sizeof(flags);
++
++    DEBUG_PRINT("flags = %d", flags);
++
++    cmd = buff;
++    buff += strlen(buff) + 1;
++
++    cwd = buff;
++    buff += strlen(buff) + 1;
++
++    DEBUG_PRINT("cmd \"%s\", cwd \"%s\"\n", cmd, cwd);
++
++    if (*buff == '\0') {
++        wd = NULL;
++    } else {
++        wd = buff;
++        buff += strlen(buff) + 1;
++    }
++    buff++;
++
++    DEBUG_PRINT("wd = %s", wd);
++
++    cnt = get_int32(buff);
++    buff += sizeof(cnt);
++    new_environ = malloc(sizeof(char*)*(cnt + 1));
++
++    DEBUG_PRINT("env_len = %d", cnt);
++    for (i = 0; i < cnt; i++, buff++) {
++        new_environ[i] = buff;
++        while(*buff != '\0') buff++;
++    }
++    new_environ[cnt] = NULL;
++
++    if (o_buff + size != buff) {
++        /* This is a spawn executable call */
++        cnt = get_int32(buff);
++        buff += sizeof(cnt);
++        args = malloc(sizeof(char*)*(cnt + 1));
++        for (i = 0; i < cnt; i++, buff++) {
++            args[i] = buff;
++            while(*buff != '\0') buff++;
++        }
++        args[cnt] = NULL;
++    }
++
++    if (o_buff + size != buff) {
++        errno = EINVAL;
++        errln = __LINE__;
++        warning("erl_child_setup: failed with protocol "
++                "error %d on line %d", errno, errln);
++        /* we abort here as it is most likely a symptom of an
++           emulator/erl_child_setup bug */
++        abort();
++    }
++
++    DEBUG_PRINT("read ack");
++    do {
++        ErtsSysForkerProto proto;
++        res = read(pipes[0], &proto, sizeof(proto));
++        if (res > 0) {
++            ASSERT(proto.action == ErtsSysForkerProtoAction_Ack);
++            ASSERT(res == sizeof(proto));
++        }
++    } while(res < 0 && (errno == EINTR || errno == ERRNO_BLOCK));
++
++    DEBUG_PRINT("... read res %d\n", res);
++    if (res < 1) {
++        errno = EPIPE;
++        errln = __LINE__;
++        goto child_error;
++    }
++
++    DEBUG_PRINT("Set cwd to: '%s'",cwd);
++
++    if (chdir(cwd) < 0) {
++        /* This is not good, it probably means that the cwd of
++           beam is invalid. We ignore it and try anyways as
++           the child might now need a cwd or the chdir below
++           could take us to a valid directory.
++        */
++    }
++
++    DEBUG_PRINT("Set wd to: '%s'",wd);
++
++    if (wd && chdir(wd) < 0) {
++        int err = errno;
++        fprintf(stderr,"spawn: Could not cd to %s\r\n", wd);
++        _exit(err);
++    }
++
++    DEBUG_PRINT("Do that forking business: '%s'",cmd);
++
++    /* simple dispatch */
++    p = strchr(cmd, ' ');
++    if (p) {
++        *p = '\0';
++        if (strcmp(cmd, "exec")) {
++            warning("not exec command; unhandled: \"%s %s\"\n", cmd, p + 1);
++        } else {
++            cmd = p + 1;
++            p = strchr(cmd, ' ');
++            if (p)
++                *p = '\0';
++            /* ignore args for now... */
++            DEBUG_PRINT("program name is \"%s\"", cmd);
++            if (!strcmp(cmd, "inet_gethost"))
++                retcode = simple_inet_gethost(pipes);
++            else
++                warning("unhandled exec command: \"%s %s\"\n", cmd,
++                        p ? p + 1 : "");
++        }
++    } else {
++        warning("unable to execute command: \"%s\"\n", cmd);
++    }
++
++    close(pipes[0]);
++    close(pipes[1]);
++    close(pipes[2]);
++    free(pipes);
++    pthread_exit((void *)(long)retcode);
++  child_error:
++    fprintf(stderr, "erl_child_setup: failed with error %d on line %d\r\n",
++            errno, errln);
++    pthread_exit((void *)-1);
++}
++
++void *erl_child_setup_thread(void *arg)
++{
++    int uds_fd = (long)arg;
++    DEBUG_PRINT("in %s, uds_fd %d", __func__, uds_fd);
++
++    prctl(PR_SET_NAME, "child_setup_thread");
++    while (1) {
++        /* shouldn't really need select, but there might be something else to deal with... */
++        fd_set read_fds;
++        int res;
++        FD_ZERO(&read_fds);
++        FD_SET(uds_fd, &read_fds);
++        DEBUG_PRINT("child_setup selecting on %d", uds_fd);
++        res = select(uds_fd+1, &read_fds, NULL, NULL, NULL);
++
++        if (res < 0) {
++            if (errno == EINTR) continue;
++            ABORT("Select failed: %d (%d)",res, errno);
++        }
++
++        if (FD_ISSET(uds_fd, &read_fds)) {
++            int res;
++            int *pipes;
++            ErtsSysForkerProto proto;
++            pthread_t new_child;
++
++            errno = 0;
++            pipes = malloc(sizeof(int) * 3);
++            if ((res = sys_uds_read(uds_fd, (char*)&proto, sizeof(proto),
++                                    pipes, 3, MSG_DONTWAIT)) < 0) {
++                if (errno == EINTR)
++                    continue;
++                DEBUG_PRINT("erl_child_setup failed to read from uds: %d, %d", res, errno);
++                goto fail;
++            }
++
++            /* This will only work in Nanos and is likely to break if run
++               under Linux. Nanos currently does not have support for passing
++               file descriptors via SCM_RIGHTS, let alone even supporting
++               ancillary data over a unix domain socket. We left the sys_uds_*
++               interface alone, and still pass pipes to the read above, but
++               all it will do in Nanos is fill it with zeros. Thankfully, the
++               original file descriptors are stashed in proto, so just copy
++               them back out here. */
++            memcpy(pipes, proto.u.start.fds, sizeof(int) * 3);
++
++            if (res == 0) {
++                DEBUG_PRINT("uds was closed!");
++                goto fail;
++            }
++            DEBUG_PRINT("### proto action %d, pipes[0] %d, pipes[1] %d",
++                        proto.action, pipes[0], pipes[1]);
++            /* Since we use unix domain sockets and send the entire data in
++               one go we *should* get the entire payload at once. */
++            ASSERT(res == sizeof(proto));
++            ASSERT(proto.action == ErtsSysForkerProtoAction_Start);
++
++            if (pthread_create(&new_child, 0, start_new_child, pipes) < 0) {
++                erts_exit(ERTS_ABORT_EXIT,
++                          "Could not create new child pthread: %d (%s)\n",
++                          errno, strerror(errno));
++            }
++            if (pthread_detach(new_child) < 0) {
++                erts_exit(ERTS_ABORT_EXIT,
++                          "Unable to detach child pthread: %d (%s)\n",
++                          errno, strerror(errno));
++            }
++
++            /* We write an ack here, but expect the reply on
++               the pipes[0] inside the fork */
++            proto.action = ErtsSysForkerProtoAction_Go;
++            proto.u.go.os_pthread = new_child; /* aliased with proto.u.go.os_pid */
++            proto.u.go.error_number = errno;
++            while (write(pipes[1], &proto, sizeof(proto)) < 0 && errno == EINTR)
++                ; /* remove gcc warning */
++
++#ifdef FORKER_PROTO_START_ACK
++            proto.action = ErtsSysForkerProtoAction_StartAck;
++            while (write(uds_fd, &proto, sizeof(proto)) < 0 && errno == EINTR)
++                ; /* remove gcc warning */
++#endif
++        }
++    }
++    pthread_exit(0);
++  fail:
++    pthread_exit((void *)1);
++}
+diff --git a/erts/emulator/sys/unix/sys_drivers.c b/erts/emulator/sys/unix/sys_drivers.c
+index 152d175..2de644c 100644
+--- a/erts/emulator/sys/unix/sys_drivers.c
++++ b/erts/emulator/sys/unix/sys_drivers.c
+@@ -1642,6 +1642,18 @@ void fd_ready_async(ErlDrvData drv_data,
+ 
+ static int forker_fd;
+ 
++static int is_single_process;
++
++static pthread_t child_setup_thread;
++
++static void check_single_process_environment(void)
++{
++    struct utsname u;
++    if (uname(&u) == 0 &&
++        !strcmp(u.sysname, "Nanos"))
++        is_single_process = 1;
++}
++
+ static ErlDrvData forker_start(ErlDrvPort port_num, char* name,
+                                SysDriverOpts* opts)
+ {
+@@ -1652,31 +1664,34 @@ static ErlDrvData forker_start(ErlDrvPort port_num, char* name,
+     char bindir[MAXPATHLEN];
+     size_t bindirsz = sizeof(bindir);
+     Uint csp_path_sz;
+-    char *child_setup_prog;
++    char *child_setup_prog = 0;
+ 
+     forker_port = erts_drvport2id(port_num);
++    check_single_process_environment();
++
++    if (!is_single_process) {
++        res = erts_sys_explicit_8bit_getenv("BINDIR", bindir, &bindirsz);
++        if (res == 0) {
++            erts_exit(1, "Environment variable BINDIR is not set\n");
++        } else if(res < 0) {
++            erts_exit(1, "Value of environment variable BINDIR is too large\n");
++        }
+ 
+-    res = erts_sys_explicit_8bit_getenv("BINDIR", bindir, &bindirsz);
+-    if (res == 0) {
+-        erts_exit(1, "Environment variable BINDIR is not set\n");
+-    } else if(res < 0) {
+-        erts_exit(1, "Value of environment variable BINDIR is too large\n");
++        if (bindir[0] != DIR_SEPARATOR_CHAR)
++            erts_exit(1,
++                      "Environment variable BINDIR does not contain an"
++                      " absolute path\n");
++        csp_path_sz = (strlen(bindir)
++                       + 1 /* DIR_SEPARATOR_CHAR */
++                       + sizeof(CHILD_SETUP_PROG_NAME)
++                       + 1);
++        child_setup_prog = erts_alloc(ERTS_ALC_T_CS_PROG_PATH, csp_path_sz);
++        erts_snprintf(child_setup_prog, csp_path_sz,
++                      "%s%c%s",
++                      bindir,
++                      DIR_SEPARATOR_CHAR,
++                      CHILD_SETUP_PROG_NAME);
+     }
+-
+-    if (bindir[0] != DIR_SEPARATOR_CHAR)
+-        erts_exit(1,
+-                 "Environment variable BINDIR does not contain an"
+-                 " absolute path\n");
+-    csp_path_sz = (strlen(bindir)
+-                   + 1 /* DIR_SEPARATOR_CHAR */
+-                   + sizeof(CHILD_SETUP_PROG_NAME)
+-                   + 1);
+-    child_setup_prog = erts_alloc(ERTS_ALC_T_CS_PROG_PATH, csp_path_sz);
+-    erts_snprintf(child_setup_prog, csp_path_sz,
+-                  "%s%c%s",
+-                  bindir,
+-                  DIR_SEPARATOR_CHAR,
+-                  CHILD_SETUP_PROG_NAME);
+     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0) {
+         erts_exit(ERTS_ABORT_EXIT,
+                  "Could not open unix domain socket in spawn_init: %d\n",
+@@ -1684,44 +1699,50 @@ static ErlDrvData forker_start(ErlDrvPort port_num, char* name,
+     }
+ 
+     forker_fd = fds[0];
++    if (is_single_process) {
++        if (pthread_create(&child_setup_thread, 0, erl_child_setup_thread, (void *)(long)fds[1]) < 0) {
++            erts_exit(ERTS_ABORT_EXIT,
++                      "Could not create child setup pthread: %d (%s)\n",
++                      errno, strerror(errno));
++        }
++    } else {
++        unbind = erts_sched_bind_atfork_prepare();
+ 
+-    unbind = erts_sched_bind_atfork_prepare();
+-
+-    i = fork();
+-
+-    if (i == 0) {
+-        /* The child */
+-        char *cs_argv[FORKER_ARGV_NO_OF_ARGS] =
+-            {CHILD_SETUP_PROG_NAME, NULL, NULL};
+-        char buff[128];
++        i = fork();
++        if (i == 0) {
++            /* The child */
++            char *cs_argv[FORKER_ARGV_NO_OF_ARGS] =
++                {CHILD_SETUP_PROG_NAME, NULL, NULL};
++            char buff[128];
+ 
+-        erts_sched_bind_atfork_child(unbind);
++            erts_sched_bind_atfork_child(unbind);
+ 
+-        snprintf(buff, 128, "%d", sys_max_files());
+-        cs_argv[FORKER_ARGV_MAX_FILES] = buff;
++            snprintf(buff, 128, "%d", sys_max_files());
++            cs_argv[FORKER_ARGV_MAX_FILES] = buff;
+ 
+-        /* We preallocate fd 3 for the uds fd */
+-        if (fds[1] != 3) {
+-            dup2(fds[1], 3);
+-        }
++            /* We preallocate fd 3 for the uds fd */
++            if (fds[1] != 3) {
++                dup2(fds[1], 3);
++            }
+ 
+ #if defined(USE_SETPGRP_NOARGS)		/* SysV */
+-    (void) setpgrp();
++            (void) setpgrp();
+ #elif defined(USE_SETPGRP)		/* BSD */
+-    (void) setpgrp(0, getpid());
++            (void) setpgrp(0, getpid());
+ #else					/* POSIX */
+-    (void) setsid();
++            (void) setsid();
+ #endif
+ 
+-        execv(child_setup_prog, cs_argv);
+-        _exit(1);
+-    }
++            execv(child_setup_prog, cs_argv);
++            _exit(1);
++        }
+ 
+-    erts_sched_bind_atfork_parent(unbind);
++        erts_sched_bind_atfork_parent(unbind);
+ 
+-    erts_free(ERTS_ALC_T_CS_PROG_PATH, child_setup_prog);
++        erts_free(ERTS_ALC_T_CS_PROG_PATH, child_setup_prog);
+ 
+-    close(fds[1]);
++        close(fds[1]);
++    }
+ 
+     SET_NONBLOCKING(forker_fd);
+ 
+@@ -1736,10 +1757,14 @@ static void forker_stop(ErlDrvData e)
+ 
+ static ErlDrvSizeT forker_deq(ErlDrvPort port_num, ErtsSysForkerProto *proto)
+ {
+-    close(proto->u.start.fds[0]);
+-    close(proto->u.start.fds[1]);
+-    if (proto->u.start.fds[1] != proto->u.start.fds[2])
+-        close(proto->u.start.fds[2]);
++    /* Nanos: We need to keep these fds open, for they are being passed as-is
++       to the child setup thread, without using ancillary data (SCM_RIGHTS). */
++    if (!is_single_process) {
++        close(proto->u.start.fds[0]);
++        close(proto->u.start.fds[1]);
++        if (proto->u.start.fds[1] != proto->u.start.fds[2])
++            close(proto->u.start.fds[2]);
++    }
+ 
+     return driver_deq(port_num, sizeof(*proto));
+ }
