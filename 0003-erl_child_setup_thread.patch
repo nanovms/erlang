@@ -48,10 +48,10 @@ index 0058b92..6032697 100644
  #endif /* #ifndef _ERL_UNIX_FORKER_H */
 diff --git a/erts/emulator/sys/unix/erl_child_setup_thread.c b/erts/emulator/sys/unix/erl_child_setup_thread.c
 new file mode 100644
-index 0000000..7a13a03
+index 0000000..cc9fb60
 --- /dev/null
 +++ b/erts/emulator/sys/unix/erl_child_setup_thread.c
-@@ -0,0 +1,1011 @@
+@@ -0,0 +1,1046 @@
 +/*
 + * %CopyrightBegin%
 + *
@@ -217,6 +217,41 @@ index 0000000..7a13a03
 +	    return nbytes;
 +	}
 +    }
++}
++
++static int write_exact(int fd, AddrByte *buff, int len)
++{
++    int res;
++    int x = len;
++    DEBUG_PRINT("%s: fd %d, buff %p, len %d\n", __func__, fd, buff, len);
++    for(;;) {
++	if((res = write(fd, buff, x)) == x) {
++	    break;
++	}
++        DEBUG_PRINT("   res %d, errno %d\n", res, errno);
++	if (res < 0) {
++	    if (errno == EINTR) {
++		continue;
++	    } else if (errno == EPIPE) {
++		return 0;
++	    }
++#ifdef ENXIO
++	    else if (errno == ENXIO) {
++		return 0;
++	    }
++#endif
++	    else {
++		return -1;
++	    }
++	} else {
++	    /* Hmmm, blocking write but not all written, could this happen
++	       if the other end was closed during the operation? Well,
++	       it costs very little to handle anyway... */
++	    x -= res;
++	    buff += res;
++	}
++    }
++    return len;
 +}
 +
 +static OpType get_op(AddrByte *buff)
@@ -691,7 +726,7 @@ index 0000000..7a13a03
 +    }
 +
 +    /* write response */
-+    if (data_size > 0 && write(rec->out_fd, reply, data_size) < 0) {
++    if (data_size > 0 && write_exact(rec->out_fd, reply, data_size) < 0) {
 +        warning("%s: write to out_fd %d, size %ld failed: %d (%s)\n",
 +                __func__, rec->out_fd, data_size, errno, strerror(errno));
 +    }
@@ -1049,12 +1084,12 @@ index 0000000..7a13a03
 +            proto.action = ErtsSysForkerProtoAction_Go;
 +            proto.u.go.os_pthread = new_child; /* aliased with proto.u.go.os_pid */
 +            proto.u.go.error_number = errno;
-+            while (write(pipes[1], &proto, sizeof(proto)) < 0 && errno == EINTR)
++            while (write_exact(pipes[1], (AddrByte*)&proto, sizeof(proto)) < 0 && errno == EINTR)
 +                ; /* remove gcc warning */
 +
 +#ifdef FORKER_PROTO_START_ACK
 +            proto.action = ErtsSysForkerProtoAction_StartAck;
-+            while (write(uds_fd, &proto, sizeof(proto)) < 0 && errno == EINTR)
++            while (write_exact(uds_fd, (AddrByte*)&proto, sizeof(proto)) < 0 && errno == EINTR)
 +                ; /* remove gcc warning */
 +#endif
 +        }
