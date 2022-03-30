@@ -1,0 +1,119 @@
+Derive node name from interface address
+
+Some erlang programs are controlled via the erlang RPC interface, reachable
+via a node name set on startup with the "-node" argument to erlexec. For
+example, the node name "foo@127.0.0.1" indicates that the node named 'foo' is
+reachable locally, via the loopback interface. However, erlang programs
+running on a Nanos unikernel cannot be controlled by a process on the same
+host and must instead be controlled over a network. When DHCP is used to
+assign network interfaces, the fully qualified node name cannot be known when
+staging the image with the preferred arguments. This patch allows the node
+name for an instance to be set using the address of a specified interface. The
+hostname in the -name argument may be set to "%<if>" where <if> is the
+interface name.
+
+For example, using the argument "-name foo@%en1" will cause erlexec to get the
+configured address of interface "en1", waiting for it to be assigned via DHCP
+if necessary, then use that address to compose the name as "foo@<ifaddr>",
+where <ifaddr> is the address assigned to the interface.
+
+diff --git a/erts/etc/common/erlexec.c b/erts/etc/common/erlexec.c
+index 4c279ac..329b4fa 100644
+--- a/erts/etc/common/erlexec.c
++++ b/erts/etc/common/erlexec.c
+@@ -26,7 +26,11 @@
+ #include "etc_common.h"
+ 
+ #if defined(RUN_FROM_EMU)
+-#  include "global.h"
++#include <sys/ioctl.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include "global.h"
+ #endif
+ 
+ #include "erl_driver.h"
+@@ -415,6 +419,70 @@ static void add_boot_config(void)
+ # define ADD_BOOT_CONFIG
+ #endif
+ 
++#ifdef RUN_FROM_EMU
++static char *process_nodename(char *namearg)
++{
++    int fd, waiting = 0;
++    char *hostname;
++    struct ifreq ifr;
++
++    hostname = strchr(namearg, '@');
++    if (!hostname)
++        return namearg;
++    hostname++;
++    if (hostname[0] != '%')
++        return namearg;
++
++    fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0) {
++        fprintf(stderr, "%s: unable to open socket: %s\n", __func__, strerror(errno));
++        return namearg;
++    }
++
++    do {
++        struct sockaddr_in *sin;
++        ifr.ifr_addr.sa_family = AF_INET;
++        strncpy(ifr.ifr_name, hostname + 1, IFNAMSIZ-1);
++        if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
++            fprintf(stderr, "%s: ioctl for SIOCGIFADDR failed: %s\n", __func__, strerror(errno));
++            close(fd);
++            return namearg;
++        }
++        sin = (struct sockaddr_in *)&ifr.ifr_addr;
++        if (sin->sin_addr.s_addr != 0) {
++            int sname_len = hostname - namearg;
++            int addr_len, total;
++            char *addr;
++            char *newnode;
++
++            if (waiting)
++                fprintf(stderr, "\n");
++            close(fd);
++            addr = inet_ntoa(sin->sin_addr);
++            addr_len = strlen(addr);
++            total = sname_len + addr_len + 1;
++            newnode = malloc(total);
++            if (!newnode) {
++                fprintf(stderr, "%s: unable to allocate %d bytes for node name\n", __func__, total);
++                return namearg;
++            }
++            strncpy(newnode, namearg, sname_len);
++            strncpy(newnode + sname_len, addr, addr_len + 1);
++            newnode[total - 1] = '\0';
++            fprintf(stderr, "%s: node name is \"%s\"\n", progname, newnode);
++            return newnode;
++        }
++        if (!waiting) {
++            waiting = 1;
++            fprintf(stderr, "%s: waiting for address assignment for interface \"%s\"...\n",
++                    progname, hostname + 1);
++        } else {
++            fprintf(stderr, ".");
++        }
++        sleep(1);
++    } while (1);
++}
++#endif
+ 
+ #ifdef __WIN32__
+ __declspec(dllexport) int win_erlexec(int argc, char **argv, HANDLE module, int windowed)
+@@ -745,7 +813,11 @@ int main(int argc, char **argv)
+ 			 */
+ 
+ 			add_arg(argv[i]);
++#ifdef RUN_FROM_EMU
++			add_arg(process_nodename(argv[i+1]));
++#else
+ 			add_arg(argv[i+1]);
++#endif
+ 			isdistributed = 1;
+ 			i++;
+ 		    } else if (strcmp(argv[i], "-noinput") == 0) {

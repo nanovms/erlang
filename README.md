@@ -11,7 +11,12 @@ Patch your repo:
 patch -p1 -ruN -d ~/otp < 0001-BEAM-embed-erlexec-and-EPMD.patch
 patch -p1 -ruN -d ~/otp < 0002-kernel-auth-erl-skip-cookie-file-permission-checks.patch
 patch -p1 -ruN -d ~/otp < 0003-erl_child_setup_thread.patch
+patch -p1 -ruN -d ~/otp < 0004-erlexec-nodename-from-ifaddr.patch
+patch -p1 -ruN -d ~/otp < 0005-erl_child_setup_thread-netstat-for-inet_ext.patch
 ```
+
+(Note that the last patch is only useful for packages that use the "inet_ext"
+package for erlang, such as Helium Miner.)
 
 Build:
 ```
