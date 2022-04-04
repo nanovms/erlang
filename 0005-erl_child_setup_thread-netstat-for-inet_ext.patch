@@ -1,0 +1,170 @@
+Emulate netstat command used by the "inet_ext" package for erlang
+
+This adds a feature to erl_child_setup_thread() to parse and handle the
+command of the form "netstat -rn |grep <ifname>|grep default|awk '{print
+$2}'", used to obtain the default gateway address for interface <ifname>. This
+patch is only necessary for programs that depend on inet_ext (e.g. Helium
+Miner).
+
+diff --git a/erts/emulator/sys/unix/erl_child_setup_thread.c b/erts/emulator/sys/unix/erl_child_setup_thread.c
+index cc9fb60..b4d34ce 100644
+--- a/erts/emulator/sys/unix/erl_child_setup_thread.c
++++ b/erts/emulator/sys/unix/erl_child_setup_thread.c
+@@ -34,6 +34,11 @@
+ #include <sys/select.h>
+ #include <arpa/inet.h>
+ #include <pthread.h>
++#include <ifaddrs.h>
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++#include <arpa/inet.h>
++#include <net/if.h>
+ 
+ #define WANT_NONBLOCKING    /* must define this to pull in defs from sys.h */
+ #include "sys.h"
+@@ -787,6 +792,136 @@ static int simple_inet_gethost(int *pipes)
+     }
+ }
+ 
++static int simple_netstat(int *pipes, char *arg)
++{
++    /* for helium miner: extract gateway route using command of the form:
++       "netstat -rn |grep en1|grep default|awk '{print $2}'"
++    */
++
++    int fd;
++    int family = AF_INET;
++    struct sockaddr_nl nladdr;
++    struct req {
++        struct nlmsghdr nlh;
++        struct rtgenmsg msg;
++    } req;
++    uint8_t buf[4096];
++    struct iovec iov;
++    struct msghdr msg;
++    int ret, avail, expect_len;
++    char ifname[IF_NAMESIZE];
++    char gwaddr[INET_ADDRSTRLEN];
++    char *if_arg, *c;
++    int nlmsg_seq = 3;
++
++    DEBUG_PRINT("%s: arg: \"%s\"", __func__, arg);
++    if (strncmp(arg, "-rn", 3)) {
++        fprintf(stderr, "%s: unhandled netstat args: \"%s\"\n", __func__, arg);
++        return -1;
++    }
++    if_arg = strstr(arg, "en");
++    if (!if_arg || !(c = strchr(if_arg, '|'))) {
++        fprintf(stderr, "%s: could not parse interface from args: \"%s\"\n", __func__, arg);
++        return -1;
++    }
++    *c = '\0';
++    DEBUG_PRINT("if arg \"%s\"", if_arg);
++
++    fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
++    ASSERT(fd >= 0);
++    memset(&nladdr, '\0', sizeof(nladdr));
++    nladdr.nl_pid = 0;
++    nladdr.nl_family = AF_NETLINK;
++    ASSERT(bind(fd, (struct sockaddr *)&nladdr, sizeof(nladdr)) == 0);
++
++  retry:
++    nladdr.nl_pid = 0;
++    memset(&req, '\0', sizeof(req));
++    req.nlh.nlmsg_len = sizeof(req);
++    req.nlh.nlmsg_type = RTM_GETROUTE;
++    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
++    req.nlh.nlmsg_pid = nladdr.nl_pid;
++    req.nlh.nlmsg_seq = nlmsg_seq++;
++    iov.iov_base = buf;
++    msg.msg_name = &nladdr;
++    msg.msg_namelen = sizeof(nladdr);
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    msg.msg_control = NULL;
++    msg.msg_controllen = 0;
++    msg.msg_flags = 0;
++
++    req.msg.rtgen_family = family;
++    memcpy(iov.iov_base, &req, sizeof(req));
++    iov.iov_len = sizeof(req);
++    ret = sendmsg(fd, &msg, 0);
++    ERTS_ASSERT(ret == sizeof(req));
++    iov.iov_len = sizeof(buf);
++    avail = recvmsg(fd, &msg, 0);
++    expect_len = NLMSG_LENGTH(sizeof(struct rtmsg));
++    ERTS_ASSERT(avail >= expect_len);
++    ERTS_ASSERT(((struct nlmsghdr *)msg.msg_iov[0].iov_base)->nlmsg_len >= expect_len);
++
++    for (struct nlmsghdr *nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, avail);
++         nlh = NLMSG_NEXT(nlh, avail)) {
++        struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
++        int rta_len = RTM_PAYLOAD(nlh);
++        DEBUG_PRINT("nlmsg: len %d, type %d, flags %d, seq %d, pid %d",
++                    nlh->nlmsg_len, nlh->nlmsg_type, nlh->nlmsg_flags, nlh->nlmsg_seq, nlh->nlmsg_pid);
++        if (nlh->nlmsg_type == NLMSG_DONE)
++            break;
++        ifname[0] = '\0';
++        gwaddr[0] = '\0';
++        ASSERT(rtm->rtm_family == family);
++        if (rtm->rtm_table != RT_TABLE_MAIN)
++            continue;
++        DEBUG_PRINT("family %d, dst_len %d, src_len %d, tos %d, table %d, "
++                    "protocol %d, scope %d, type %d, flags 0x%x",
++                    rtm->rtm_family, rtm->rtm_dst_len, rtm->rtm_src_len, rtm->rtm_tos, rtm->rtm_table,
++                    rtm->rtm_protocol, rtm->rtm_scope, rtm->rtm_type, rtm->rtm_flags);
++        for (struct rtattr *rta = (struct rtattr *)RTM_RTA(rtm); RTA_OK(rta, rta_len);
++             rta = RTA_NEXT(rta, rta_len)) {
++            DEBUG_PRINT(" -> RTA type %d, len %d", rta->rta_type, rta->rta_len);
++            DEBUG_PRINT("   %d %d %d %d", *(unsigned char *)(RTA_DATA(rta) + 0),
++                        *(unsigned char *)(RTA_DATA(rta) + 1),
++                        *(unsigned char *)(RTA_DATA(rta) + 2),
++                        *(unsigned char *)(RTA_DATA(rta) + 3));
++
++            switch (rta->rta_type) {
++            case RTA_OIF:
++                if (!if_indextoname(*(unsigned int *)RTA_DATA(rta), ifname))
++                    fprintf(stderr, "if_indextoname failed: %d (%s)\n", errno, strerror(errno));
++                break;
++            case RTA_GATEWAY:
++                if (!inet_ntop(family, RTA_DATA(rta), gwaddr, sizeof(gwaddr)))
++                    goto inet_ntop_failed;
++                break;
++            }
++        }
++        if (ifname[0] && !strcmp(ifname, if_arg) && gwaddr[0]) {
++            int size, rv;
++            char gwstr[32];
++            size = snprintf(gwstr, 32, "%s\n", gwaddr);
++            rv = write_exact(pipes[1], (AddrByte*)gwstr, size);
++            DEBUG_PRINT("wrote \"%s\", %d bytes\n", gwstr, rv);
++            if (rv < size) {
++                warning("%s: failed to write response \"%s\" (%d bytes) rv %d, errno %d\n",
++                        __func__, gwstr, size, rv, errno);
++            }
++            goto done;
++        }
++    }
++    sleep(1);                   /* wait for DHCP */
++    goto retry;
++  done:
++    ASSERT(close(fd) == 0);
++    return 0;
++  inet_ntop_failed:
++    fprintf(stderr, "inet_ntop failed: %d (%s)\n", errno, strerror(errno));
++    ASSERT(close(fd) == 0);
++    return 1;
++}
++
+ static void *start_new_child(void *arg)
+ {
+     int *pipes = arg;
+@@ -938,6 +1073,8 @@ static void *start_new_child(void *arg)
+             DEBUG_PRINT("program name is \"%s\"", cmd);
+             if (!strcmp(cmd, "inet_gethost"))
+                 retcode = simple_inet_gethost(pipes);
++            else if (!strcmp(cmd, "netstat") && p)
++                retcode = simple_netstat(pipes, p + 1);
+             else
+                 warning("unhandled exec command: \"%s %s\"\n", cmd,
+                         p ? p + 1 : "");
