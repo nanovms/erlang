@@ -13,9 +13,10 @@ patch -p1 -ruN -d ~/otp < 0002-kernel-auth-erl-skip-cookie-file-permission-check
 patch -p1 -ruN -d ~/otp < 0003-erl_child_setup_thread.patch
 patch -p1 -ruN -d ~/otp < 0004-erlexec-nodename-from-ifaddr.patch
 patch -p1 -ruN -d ~/otp < 0005-erl_child_setup_thread-netstat-for-inet_ext.patch
+patch -p1 -ruN -d ~/otp < 0006-disable-mremap.patch
 ```
 
-(Note that the last patch is only useful for packages that use the "inet_ext"
+(Note that the patch 0005 is only useful for packages that use the "inet_ext"
 package for erlang, such as Helium Miner.)
 
 Build:

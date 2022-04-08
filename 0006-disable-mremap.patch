@@ -1,0 +1,22 @@
+disable use of mremap()
+
+This patch prevents avoids a crash that occurs when the address returned by
+mremap() is effectively being masked by ERTS_SUPERALIGNED_MASK, leading to a
+subsequent fault on unmapped memory. The root cause of this masking is still
+being investigated, but removing the definition of ERTS_HAVE_OS_MREMAP allows
+erlang/OTP to run without using mremap() for the time being.
+
+diff --git a/erts/emulator/sys/common/erl_mmap.h b/erts/emulator/sys/common/erl_mmap.h
+index a30b7d2..c29fb62 100644
+--- a/erts/emulator/sys/common/erl_mmap.h
++++ b/erts/emulator/sys/common/erl_mmap.h
+@@ -36,9 +36,6 @@
+ #if HAVE_MMAP
+ #  define ERTS_HAVE_OS_MMAP 1
+ #  define ERTS_HAVE_GENUINE_OS_MMAP 1
+-#  if HAVE_MREMAP
+-#    define ERTS_HAVE_OS_MREMAP 1
+-#  endif
+ /*
+  * MAP_NORESERVE is undefined in FreeBSD 10.x and later.
+  * This is to enable 64bit HiPE experimentally on FreeBSD.
